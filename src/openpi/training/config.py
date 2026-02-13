@@ -13,6 +13,7 @@ import flax.nnx as nnx
 from typing_extensions import override
 import tyro
 
+import openpi.policies.drone_policy as drone_policy
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
@@ -352,6 +353,66 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotDroneToTableDataConfig(DataConfigFactory):
+    """
+    Defines how to process drone_to_table data from a LeRobot dataset for training.
+
+    Expected LeRobot keys per frame:
+      - image (room_view)
+      - wrist_image (drone_front)
+      - state (xyz, shape (3,))
+      - actions (xyz, shape (3,))
+      - task (string)  --> will become prompt if prompt_from_task=True
+    """
+
+    # If True, convert absolute xyz actions -> delta xyz for training (and invert at inference).
+    # If your dataset actions are already deltas, keep False.
+    extra_delta_transform: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack LeRobot keys into the "common" keys expected by the policy transforms.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",  # created when prompt_from_task=True
+                        # If you are NOT using prompt_from_task, you can map from task:
+                        # "prompt": "task",
+                    }
+                )
+            ]
+        )
+
+        # Your dataset-specific transforms (from src/openpi/policies/drone_policy.py)
+        data_transforms = _transforms.Group(
+            inputs=[drone_policy.DroneToTableInputs(model_type=model_config.model_type)],
+            outputs=[drone_policy.DroneToTableOutputs(action_dim=3)],
+        )
+
+        # Optional absolute -> delta conversion (xyz only => mask length 3)
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(3, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("actions",),
         )
 
 
@@ -761,6 +822,54 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
+
+    TrainConfig(
+    name="pi05_drone_to_table",
+    model=pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=32,         # IMPORTANT for pi05 base checkpoints
+        action_horizon=10,
+        discrete_state_input=False,
+    ),
+    data=LeRobotDroneToTableDataConfig(
+        repo_id="Celina717/drone_to_table_lerobot_first100",  # <-- MUST match your convert --repo_id
+        base_config=DataConfig(prompt_from_task=True),
+        extra_delta_transform=False,  # set True if you want delta training
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    num_train_steps=30_000,
+    batch_size=64, # XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_drone_to_table --exp-name exp1_bs8
+
+    ),
+    TrainConfig(
+    name="pi05_drone_to_table_lora",
+    model=pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=32,
+        action_horizon=10,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+    ),
+    data=LeRobotDroneToTableDataConfig(
+        repo_id="Celina717/drone_to_table_lerobot_first100",
+        base_config=DataConfig(prompt_from_task=True),
+        extra_delta_transform=False,
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    freeze_filter=pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=32,
+        action_horizon=10,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+    ).get_freeze_filter(),
+    ema_decay=None,
+    batch_size=16,
+    num_train_steps=30_000,
+    ),
+
     #
     # Fine-tuning Aloha configs.
     #
@@ -987,3 +1096,4 @@ def get_config(config_name: str) -> TrainConfig:
         raise ValueError(f"Config '{config_name}' not found.{closest_str}")
 
     return _CONFIGS_DICT[config_name]
+
