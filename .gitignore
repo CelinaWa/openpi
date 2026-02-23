@@ -171,3 +171,4 @@ cython_debug/
 !assets/tokenizers/
 !assets/tokenizers/paligemma/
 !assets/tokenizers/paligemma/tokenizer.model
+pt_venv/

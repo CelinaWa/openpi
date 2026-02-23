@@ -45,6 +45,7 @@ import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+from peft import LoraConfig, get_peft_model
 
 
 def init_logging():
@@ -164,7 +165,8 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
 
         # Save model state using safetensors (handle shared tensors)
         model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+        # Save LoRA adapter 
+        model_to_save.save_pretrained(tmp_ckpt_dir / "lora_adapter", safe_serialization=True)
 
         # Save optimizer state using PyTorch format
         torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
@@ -217,14 +219,14 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
     try:
         # Load model state with error handling
         logging.info("Loading model state...")
-        safetensors_path = ckpt_dir / "model.safetensors"
-
-        if safetensors_path.exists():
-            model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
-            logging.info("Loaded model state from safetensors format")
+        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        adapter_dir = ckpt_dir / "lora_adapter"
+        if adapter_dir.exists():
+            model_to_load.load_adapter(str(adapter_dir), adapter_name="default")
+            model_to_load.set_adapter("default")
+            logging.info("Loaded LoRA adapter from checkpoint")
         else:
-            raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
+            raise FileNotFoundError(f"No LoRA adapter found at {adapter_dir}")
 
         torch.cuda.empty_cache()
         gc.collect()
@@ -405,8 +407,46 @@ def train_loop(config: _config.TrainConfig):
         model_cfg = config.model
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+    # -------------------------
+    # 1) Build BASE model
+    # -------------------------
+    base_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    # -------------------------
+    # 2) Load BASE weights FIRST (important!)
+    # -------------------------
+    if config.pytorch_weight_path is not None:
+        logging.info(f"Loading BASE PyTorch weights from: {config.pytorch_weight_path}")
+        base_ckpt = os.path.join(config.pytorch_weight_path, "model.safetensors")
+        safetensors.torch.load_model(base_model, base_ckpt, device=str(device))
+        logging.info("Loaded BASE weights.")
+    
+    # -------------------------
+    # 3) Inject LoRA
+    # -------------------------
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    lora_cfg = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=target_modules,
+    )
+    model = get_peft_model(base_model, lora_cfg)
+
+    # Ensure ONLY LoRA params train
+    for n, p in model.named_parameters():
+        p.requires_grad = ("lora_" in n)
+
+    model.print_trainable_parameters()
+
+    # Optional: make sure LoRA attached to something
+    hits = [n for n, _ in model.named_modules() if any(k in n for k in target_modules)]
+    logging.info(f"LoRA target hits: {len(hits)}")
+    if len(hits) == 0:
+        raise RuntimeError("LoRA target_modules not found. Update target_modules list for PI0Pytorch.")
+
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -456,7 +496,7 @@ def train_loop(config: _config.TrainConfig):
 
     # Create optimizer with config parameters
     optim = torch.optim.AdamW(
-        model.parameters(),
+        (p for p in model.parameters() if p.requires_grad),
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,

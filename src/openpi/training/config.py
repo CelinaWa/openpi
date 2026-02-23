@@ -837,6 +837,7 @@ _CONFIGS = [
         extra_delta_transform=False,  # set True if you want delta training
     ),
     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    pytorch_weight_path="/workspace/checkpoints/pi05_base_pytorch",
     num_train_steps=30_000,
     batch_size=64, # XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_drone_to_table --exp-name exp1_bs8
 
@@ -857,6 +858,7 @@ _CONFIGS = [
         extra_delta_transform=False,
     ),
     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+
     freeze_filter=pi0_config.Pi0Config(
         pi05=True,
         action_dim=32,
