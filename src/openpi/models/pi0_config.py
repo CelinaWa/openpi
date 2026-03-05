@@ -31,6 +31,20 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # Optional semantic STL prefix encoder.
+    use_stl: bool = False
+    stl_max_nodes: int = 32
+    stl_gnn_layers: int = 2
+    stl_vocab_size: int = 4096
+    stl_text_embedding_dim: int = 384
+    stl_ap_max_tokens: int = 8
+    stl_use_ap_semantic_tokens: bool = True
+    stl_use_symbolic_ids: bool = False
+    stl_use_object_hash_in_8d: bool = False
+    stl_default_formula: str | None = "G[0:10](avoid(obstacle)) AND F[0:10](reach(target))"
+    # If true, `stl_node_token_ids` are interpreted as PaliGemma vocab ids.
+    # If false, ids are interpreted as custom STL vocabulary ids in [0, stl_vocab_size).
+    stl_use_llm_token_embeddings: bool = False
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -71,6 +85,32 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                stl_node_token_ids=(
+                    jax.ShapeDtypeStruct([batch_size, self.stl_max_nodes], jnp.int32)
+                    if self.use_stl and self.stl_use_symbolic_ids
+                    else None
+                ),
+                stl_node_mask=(jax.ShapeDtypeStruct([batch_size, self.stl_max_nodes], bool) if self.use_stl else None),
+                stl_adjacency=(
+                    jax.ShapeDtypeStruct([batch_size, self.stl_max_nodes, self.stl_max_nodes], bool)
+                    if self.use_stl
+                    else None
+                ),
+                stl_node_text_embeddings=(
+                    jax.ShapeDtypeStruct([batch_size, self.stl_max_nodes, self.stl_text_embedding_dim], jnp.float32)
+                    if self.use_stl
+                    else None
+                ),
+                stl_node_text_token_ids=(
+                    jax.ShapeDtypeStruct([batch_size, self.stl_max_nodes, self.stl_ap_max_tokens], jnp.int32)
+                    if self.use_stl and self.stl_use_ap_semantic_tokens
+                    else None
+                ),
+                stl_node_text_token_mask=(
+                    jax.ShapeDtypeStruct([batch_size, self.stl_max_nodes, self.stl_ap_max_tokens], bool)
+                    if self.use_stl and self.stl_use_ap_semantic_tokens
+                    else None
+                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

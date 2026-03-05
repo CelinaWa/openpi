@@ -99,6 +99,20 @@ class Observation(Generic[ArrayT]):
     # Tokenized prompt mask.
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Optional semantic STL graph inputs.
+    # Integer vocabulary ids per node.
+    stl_node_token_ids: at.Int[ArrayT, "*b n"] | None = None
+    # Node validity mask.
+    stl_node_mask: at.Bool[ArrayT, "*b n"] | None = None
+    # Directed adjacency matrix where adjacency[parent, child] is true.
+    stl_adjacency: at.Bool[ArrayT, "*b n n"] | None = None
+    # Optional pre-computed semantic embedding per node.
+    stl_node_text_embeddings: at.Float[ArrayT, "*b n d"] | None = None
+    # Optional per-node AP semantic token ids (e.g., tokenized AP text).
+    stl_node_text_token_ids: at.Int[ArrayT, "*b n t"] | None = None
+    # Optional per-node AP semantic token mask.
+    stl_node_text_token_mask: at.Bool[ArrayT, "*b n t"] | None = None
+
     # pi0-fast model specific fields.
 
     # Token auto-regressive mask (for FAST autoregressive model).
@@ -124,6 +138,12 @@ class Observation(Generic[ArrayT]):
             state=data["state"],
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
+            stl_node_token_ids=data.get("stl_node_token_ids"),
+            stl_node_mask=data.get("stl_node_mask"),
+            stl_adjacency=data.get("stl_adjacency"),
+            stl_node_text_embeddings=data.get("stl_node_text_embeddings"),
+            stl_node_text_token_ids=data.get("stl_node_text_token_ids"),
+            stl_node_text_token_mask=data.get("stl_node_text_token_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
@@ -203,6 +223,12 @@ def preprocess_observation(
         state=observation.state,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
+        stl_node_token_ids=observation.stl_node_token_ids,
+        stl_node_mask=observation.stl_node_mask,
+        stl_adjacency=observation.stl_adjacency,
+        stl_node_text_embeddings=observation.stl_node_text_embeddings,
+        stl_node_text_token_ids=observation.stl_node_text_token_ids,
+        stl_node_text_token_mask=observation.stl_node_text_token_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
     )
@@ -252,7 +278,7 @@ class BaseModelConfig(abc.ABC):
 
     def fake_obs(self, batch_size: int = 1) -> Observation:
         observation_spec, _ = self.inputs_spec(batch_size=batch_size)
-        return jax.tree.map(lambda x: jnp.ones(x.shape, x.dtype), observation_spec)
+        return jax.tree.map(lambda x: x if x is None else jnp.ones(x.shape, x.dtype), observation_spec)
 
     def fake_act(self, batch_size: int = 1) -> Actions:
         _, action_spec = self.inputs_spec(batch_size=batch_size)

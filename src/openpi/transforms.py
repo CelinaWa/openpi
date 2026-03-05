@@ -1,5 +1,6 @@
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
+import hashlib
 import re
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 
@@ -286,6 +287,285 @@ class TokenizeFASTInputs(DataTransformFn):
             "token_ar_mask": ar_mask,
             "token_loss_mask": loss_mask,
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class _STLNode:
+    kind: str
+    children: list["_STLNode"]
+    ap_text: str = ""
+    ts: float = -1.0
+    te: float = -1.0
+
+
+class _STLParser:
+    """Small recursive-descent parser for STL-like expressions."""
+
+    def __init__(self, tokens: list[str]):
+        self.tokens = tokens
+        self.pos = 0
+
+    def _peek(self) -> str | None:
+        if self.pos >= len(self.tokens):
+            return None
+        return self.tokens[self.pos]
+
+    def _consume(self) -> str:
+        tok = self.tokens[self.pos]
+        self.pos += 1
+        return tok
+
+    def _maybe_interval(self) -> tuple[float, float]:
+        if self._peek() != "[":
+            return -1.0, -1.0
+        self._consume()  # '['
+        left = self._consume()
+        sep = self._consume()
+        right = self._consume()
+        end = self._consume()
+        if sep not in (":", ",") or end != "]":
+            raise ValueError("Invalid interval format, expected [ts:te] or [ts,te].")
+        return float(left), float(right)
+
+    def parse(self) -> _STLNode:
+        node = self._parse_or()
+        if self._peek() is not None:
+            raise ValueError("Unexpected trailing tokens in STL expression.")
+        return node
+
+    def _parse_or(self) -> _STLNode:
+        node = self._parse_and()
+        while (tok := self._peek()) is not None and tok.upper() in ("|", "||", "OR"):
+            self._consume()
+            rhs = self._parse_and()
+            node = _STLNode(kind="OR", children=[node, rhs])
+        return node
+
+    def _parse_and(self) -> _STLNode:
+        node = self._parse_until()
+        while (tok := self._peek()) is not None and tok.upper() in ("&", "&&", "AND"):
+            self._consume()
+            rhs = self._parse_until()
+            node = _STLNode(kind="AND", children=[node, rhs])
+        return node
+
+    def _parse_until(self) -> _STLNode:
+        node = self._parse_unary()
+        while (tok := self._peek()) is not None and tok.upper() in ("U", "UNTIL"):
+            self._consume()
+            ts, te = self._maybe_interval()
+            rhs = self._parse_unary()
+            node = _STLNode(kind="UNTIL", children=[node, rhs], ts=ts, te=te)
+        return node
+
+    def _parse_unary(self) -> _STLNode:
+        tok = self._peek()
+        if tok is None:
+            raise ValueError("Unexpected end of STL expression.")
+        tok_u = tok.upper()
+        if tok_u in ("!", "NOT"):
+            self._consume()
+            return _STLNode(kind="NOT", children=[self._parse_unary()])
+        if tok_u in ("F", "EVENTUALLY"):
+            self._consume()
+            ts, te = self._maybe_interval()
+            return _STLNode(kind="EVENTUALLY", children=[self._parse_unary()], ts=ts, te=te)
+        if tok_u in ("G", "ALWAYS"):
+            self._consume()
+            ts, te = self._maybe_interval()
+            return _STLNode(kind="ALWAYS", children=[self._parse_unary()], ts=ts, te=te)
+        if tok == "(":
+            self._consume()
+            node = self._parse_or()
+            if self._peek() != ")":
+                raise ValueError("Missing ')' in STL expression.")
+            self._consume()
+            return node
+        return self._parse_ap()
+
+    def _parse_ap(self) -> _STLNode:
+        pieces: list[str] = []
+        paren_depth = 0
+        while (tok := self._peek()) is not None:
+            tok_u = tok.upper()
+            if tok == "(":
+                paren_depth += 1
+                pieces.append(self._consume())
+                continue
+            if tok == ")":
+                if paren_depth == 0:
+                    break
+                paren_depth -= 1
+                pieces.append(self._consume())
+                continue
+            if paren_depth == 0 and tok_u in ("&", "&&", "AND", "|", "||", "OR", "U", "UNTIL"):
+                break
+            pieces.append(self._consume())
+        if not pieces:
+            raise ValueError("Failed to parse AP node.")
+        return _STLNode(kind="AP", children=[], ap_text="".join(pieces))
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeSTLText(DataTransformFn):
+    """Converts raw STL text into syntax-tree graph nodes (operators + APs)."""
+
+    max_nodes: int = 32
+    vocab_size: int = 4096
+    input_key: str = "stl_text"
+    # If true, parsing failures raise; otherwise falls back to simple token chain.
+    strict_parse: bool = False
+    semantic_tokenizer: _tokenizer.PaligemmaTokenizer | None = None
+    ap_max_tokens: int = 8
+    default_stl_text: str | None = None
+    use_symbolic_ids: bool = False
+    use_object_hash_in_8d: bool = False
+
+    def _parse_ap_semantics(self, ap_text: str) -> tuple[float, float]:
+        """Extract AP type and object id from canonical APs like reach(obj), avoid(obj)."""
+        text = ap_text.strip().lower()
+        m = re.match(r"^\s*(reach|avoid)\s*\(\s*([a-z0-9_:\-\.]+)\s*\)\s*$", text)
+        if m is None:
+            return 0.0, -1.0
+        ap_word, obj_name = m.group(1), m.group(2)
+        ap_type_id = 1.0 if ap_word == "reach" else 2.0
+        obj_hash = int(hashlib.sha1(obj_name.encode("utf-8")).hexdigest(), 16)
+        obj_id_norm = float(obj_hash % max(1, self.vocab_size)) / float(max(1, self.vocab_size - 1))
+        return ap_type_id, obj_id_norm
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "stl_node_mask" in data and "stl_adjacency" in data:
+            return data
+
+        stl_text = data.get(self.input_key)
+        if stl_text is None:
+            if self.default_stl_text is None:
+                return data
+            stl_text = self.default_stl_text
+        if not isinstance(stl_text, str):
+            stl_text = stl_text.item()
+
+        token_ids = np.zeros((self.max_nodes,), dtype=np.int32)
+        node_mask = np.zeros((self.max_nodes,), dtype=bool)
+        adjacency = np.zeros((self.max_nodes, self.max_nodes), dtype=bool)
+        node_features = np.zeros((self.max_nodes, 8), dtype=np.float32)
+        text_token_ids = np.zeros((self.max_nodes, self.ap_max_tokens), dtype=np.int32)
+        text_token_mask = np.zeros((self.max_nodes, self.ap_max_tokens), dtype=bool)
+
+        op_ids = {
+            "AND": 1,
+            "OR": 2,
+            "NOT": 3,
+            "EVENTUALLY": 4,
+            "ALWAYS": 5,
+            "UNTIL": 6,
+        }
+        op_token_offset = 1
+        ap_token_offset = 128
+
+        try:
+            tokens = re.findall(
+                r"<=|>=|==|!=|\|\||&&|[()\[\],:]|[<>!&|]|[A-Za-z_][A-Za-z0-9_]*|-?\d+(?:\.\d+)?",
+                stl_text,
+            )
+            root = _STLParser(tokens).parse()
+
+            node_records: list[tuple[int, _STLNode, int, str | None, int]] = []
+            edges: list[tuple[int, int]] = []
+
+            def walk(node: _STLNode, depth: int, parent_op: str | None, child_idx: int) -> int:
+                idx = len(node_records)
+                node_records.append((idx, node, depth, parent_op, child_idx))
+                for c_i, child in enumerate(node.children):
+                    child_idx_ = walk(child, depth + 1, node.kind, c_i)
+                    edges.append((idx, child_idx_))  # parent <- child
+                return idx
+
+            walk(root, depth=0, parent_op=None, child_idx=0)
+            node_count = min(len(node_records), self.max_nodes)
+
+            for i in range(node_count):
+                _, node, depth, parent_op, child_idx = node_records[i]
+                node_mask[i] = True
+                semantic_phrase = node.kind.lower()
+                if node.kind == "AP":
+                    ap_hash = int(hashlib.sha1(node.ap_text.lower().encode("utf-8")).hexdigest(), 16)
+                    if self.use_symbolic_ids:
+                        token_ids[i] = ap_token_offset + (ap_hash % max(1, self.vocab_size - ap_token_offset))
+                    operator_id = 0.0
+                    ap_type_id, obj_id_norm = self._parse_ap_semantics(node.ap_text)
+                    if not self.use_object_hash_in_8d:
+                        obj_id_norm = -1.0
+                    is_ap = 1.0
+                    semantic_phrase = node.ap_text
+                else:
+                    operator_id = float(op_ids[node.kind])
+                    if self.use_symbolic_ids:
+                        token_ids[i] = op_token_offset + int(operator_id)
+                    ap_type_id = 0.0
+                    obj_id_norm = -1.0
+                    is_ap = 0.0
+                is_left_until = float(parent_op == "UNTIL" and child_idx == 0)
+                reserved = 0.0
+                node_features[i] = np.asarray(
+                    [
+                        operator_id,
+                        float(node.ts),
+                        float(node.te),
+                        ap_type_id,
+                        obj_id_norm,
+                        is_ap,
+                        is_left_until,
+                        reserved,
+                    ],
+                    dtype=np.float32,
+                )
+                if self.semantic_tokenizer is not None:
+                    ap_tokens = self.semantic_tokenizer._tokenizer.encode(semantic_phrase, add_bos=False, add_eos=False)
+                    ap_tokens = ap_tokens[: self.ap_max_tokens]
+                    text_token_ids[i, : len(ap_tokens)] = np.asarray(ap_tokens, dtype=np.int32)
+                    text_token_mask[i, : len(ap_tokens)] = True
+
+            for parent, child in edges:
+                if parent < self.max_nodes and child < self.max_nodes:
+                    adjacency[parent, child] = True
+
+        except Exception:
+            if self.strict_parse:
+                raise
+            # Fallback: keep a chain graph using lexical tokens to avoid dropping data.
+            raw_nodes = re.findall(r"[A-Za-z_]+|\d+(?:\.\d+)?|<=|>=|==|!=|&&|\|\||[()&|!<>+\-*/]", stl_text)
+            node_count = min(len(raw_nodes), self.max_nodes)
+            for i in range(node_count):
+                token = raw_nodes[i].lower()
+                token_hash = int(hashlib.sha1(token.encode("utf-8")).hexdigest(), 16)
+                if self.use_symbolic_ids:
+                    token_ids[i] = ap_token_offset + (token_hash % max(1, self.vocab_size - ap_token_offset))
+                node_mask[i] = True
+                node_features[i] = np.asarray(
+                    [0.0, -1.0, -1.0, 0.0, -1.0, 1.0, 0.0, 0.0],
+                    dtype=np.float32,
+                )
+                if i > 0:
+                    adjacency[i, i - 1] = True
+                if self.semantic_tokenizer is not None:
+                    ap_tokens = self.semantic_tokenizer._tokenizer.encode(token, add_bos=False, add_eos=False)
+                    ap_tokens = ap_tokens[: self.ap_max_tokens]
+                    text_token_ids[i, : len(ap_tokens)] = np.asarray(ap_tokens, dtype=np.int32)
+                    text_token_mask[i, : len(ap_tokens)] = True
+
+        output = {
+            **data,
+            "stl_node_mask": node_mask,
+            "stl_adjacency": adjacency,
+            "stl_node_text_embeddings": node_features,
+        }
+        if self.use_symbolic_ids:
+            output["stl_node_token_ids"] = token_ids
+        if self.semantic_tokenizer is not None:
+            output["stl_node_text_token_ids"] = text_token_ids
+            output["stl_node_text_token_mask"] = text_token_mask
+        return output
 
 
 @dataclasses.dataclass(frozen=True)

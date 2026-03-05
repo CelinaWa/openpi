@@ -71,13 +71,34 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
-    """Loads and validates the weights. Returns a loaded subset of the weights."""
-    loaded_params = loader.load(params_shape)
-    at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
+    """Loads and validates overlapping weights.
 
-    # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
+    For architecture-extended models (e.g. new STL modules), the checkpoint may not
+    contain all expected keys. In that case, we only validate/load the intersection,
+    and leave missing parameters at their initialized values.
+    """
+    loaded_params = loader.load(params_shape)
+    flat_expected = traverse_util.flatten_dict(params_shape)
+    flat_loaded = traverse_util.flatten_dict(loaded_params)
+
+    # Validate only overlapping keys between expected model params and loaded checkpoint params.
+    overlapping_keys = flat_expected.keys() & flat_loaded.keys()
+    expected_overlap = {k: flat_expected[k] for k in overlapping_keys}
+    loaded_overlap = {k: flat_loaded[k] for k in overlapping_keys}
+    at.check_pytree_equality(
+        expected=traverse_util.unflatten_dict(expected_overlap),
+        got=traverse_util.unflatten_dict(loaded_overlap),
+        check_shapes=True,
+        check_dtypes=True,
+    )
+
+    # Remove jax.ShapeDtypeStruct from loaded leaves and only return real arrays.
     return traverse_util.unflatten_dict(
-        {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
+        {
+            k: v
+            for k, v in loaded_overlap.items()
+            if not isinstance(v, jax.ShapeDtypeStruct)
+        }
     )
 
 

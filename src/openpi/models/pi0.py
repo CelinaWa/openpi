@@ -16,6 +16,90 @@ from openpi.shared import array_typing as at
 logger = logging.getLogger("openpi")
 
 
+class SemanticSTLEncoder(nnx.Module):
+    """Lightweight child->parent message passing encoder for semantic STL graphs."""
+
+    def __init__(self, width: int, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
+        self.width = width
+        self.vocab_size = config.stl_vocab_size
+        self.gnn_layers = config.stl_gnn_layers
+        self.text_embedding_dim = config.stl_text_embedding_dim
+        self.use_llm_token_embeddings = config.stl_use_llm_token_embeddings
+        self.use_symbolic_ids = config.stl_use_symbolic_ids
+
+        # Used when ids are custom STL vocabulary ids.
+        if self.use_symbolic_ids and not self.use_llm_token_embeddings:
+            self.vocab_proj = nnx.Linear(self.vocab_size, width, rngs=rngs)
+        else:
+            self.vocab_proj = None
+        self.text_proj = nnx.Linear(self.text_embedding_dim, width, rngs=rngs)
+        # Keep per-layer submodules in nnx.Dict so parameters are tracked in this NNX version.
+        self.self_mlps = nnx.Dict(
+            **{f"layer_{i}": nnx.Linear(width, width, rngs=rngs) for i in range(self.gnn_layers)}
+        )
+        self.child_mlps = nnx.Dict(
+            **{f"layer_{i}": nnx.Linear(width, width, rngs=rngs) for i in range(self.gnn_layers)}
+        )
+
+    def _project_text_embeddings(self, text_embeddings: jax.Array) -> jax.Array:
+        current_dim = text_embeddings.shape[-1]
+        if current_dim == self.text_embedding_dim:
+            return self.text_proj(text_embeddings)
+        # Keep this robust to mismatched external text embedding dimensions.
+        if current_dim < self.text_embedding_dim:
+            pad = self.text_embedding_dim - current_dim
+            text_embeddings = jnp.pad(text_embeddings, ((0, 0), (0, 0), (0, pad)))
+        else:
+            text_embeddings = text_embeddings[..., : self.text_embedding_dim]
+        return self.text_proj(text_embeddings)
+
+    @at.typecheck
+    def __call__(
+        self,
+        *,
+        token_embeddings: at.Float[at.Array, "b n emb"] | None,
+        token_ids: at.Int[at.Array, "b n"] | None,
+        text_embeddings: at.Float[at.Array, "b n d"] | None,
+        node_mask: at.Bool[at.Array, "b n"],
+        adjacency: at.Bool[at.Array, "b n n"],
+    ) -> at.Float[at.Array, "b n emb"]:
+        if token_embeddings is None and token_ids is None and text_embeddings is None:
+            raise ValueError("STL encoder requires one of token_embeddings, token_ids, or text_embeddings.")
+
+        h = None
+        if token_embeddings is not None:
+            h = token_embeddings
+
+        if token_ids is not None:
+            if self.use_llm_token_embeddings:
+                raise ValueError("Expected LLM-provided token embeddings when stl_use_llm_token_embeddings=True.")
+            if self.vocab_proj is None:
+                raise ValueError("Received symbolic STL token ids but symbolic-id branch is disabled.")
+            token_ids = jnp.clip(token_ids, 0, self.vocab_size - 1)
+            token_one_hot = jax.nn.one_hot(token_ids, self.vocab_size, dtype=jnp.float32)
+            token_h = self.vocab_proj(token_one_hot)
+            h = token_h if h is None else h + token_h
+
+        if text_embeddings is not None:
+            text_h = self._project_text_embeddings(text_embeddings)
+            h = text_h if h is None else h + text_h
+
+        assert h is not None
+        node_mask_f = node_mask.astype(h.dtype)
+        h = h * node_mask_f[..., None]
+        adjacency_f = adjacency.astype(h.dtype)
+
+        for i in range(self.gnn_layers):
+            self_mlp = self.self_mlps[f"layer_{i}"]
+            child_mlp = self.child_mlps[f"layer_{i}"]
+            child_agg = jnp.einsum("bij,bjd->bid", adjacency_f, h, precision=jax.lax.Precision.HIGHEST)
+            h_next = nnx.swish(self_mlp(h) + child_mlp(child_agg))
+            h = h + h_next
+            h = h * node_mask_f[..., None]
+
+        return h
+
+
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
 
@@ -90,6 +174,12 @@ class Pi0(_model.BaseModel):
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+        self.use_stl = config.use_stl
+        self.stl_use_llm_token_embeddings = config.stl_use_llm_token_embeddings
+        if self.use_stl:
+            self.stl_encoder = SemanticSTLEncoder(paligemma_config.width, config, rngs=rngs)
+        else:
+            self.stl_encoder = None
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -131,6 +221,50 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+
+        # add semantic STL graph tokens, if provided
+        if self.stl_encoder is not None:
+            if obs.stl_node_mask is not None and obs.stl_adjacency is not None:
+                token_embeddings = None
+                token_ids = None
+                if obs.stl_node_token_ids is not None:
+                    if self.stl_use_llm_token_embeddings:
+                        token_embeddings = self.PaliGemma.llm(obs.stl_node_token_ids, method="embed")
+                    else:
+                        token_ids = obs.stl_node_token_ids
+
+                # Optional semantic AP tokens per node (tokenized AP text/object phrases).
+                if obs.stl_node_text_token_ids is not None and obs.stl_node_text_token_mask is not None:
+                    bsz, n_nodes, n_ap_tokens = obs.stl_node_text_token_ids.shape
+                    flat_ids = einops.rearrange(obs.stl_node_text_token_ids, "b n t -> (b n) t")
+                    flat_mask = einops.rearrange(obs.stl_node_text_token_mask, "b n t -> (b n) t")
+                    flat_emb = self.PaliGemma.llm(flat_ids, method="embed")
+                    flat_mask_f = flat_mask.astype(flat_emb.dtype)
+                    denom = jnp.maximum(jnp.sum(flat_mask_f, axis=-1, keepdims=True), 1.0)
+                    pooled = jnp.sum(flat_emb * flat_mask_f[..., None], axis=1) / denom
+                    semantic_token_embeddings = einops.rearrange(pooled, "(b n) e -> b n e", b=bsz, n=n_nodes)
+                    token_embeddings = (
+                        semantic_token_embeddings
+                        if token_embeddings is None
+                        else token_embeddings + semantic_token_embeddings
+                    )
+                if (
+                    token_embeddings is not None
+                    or token_ids is not None
+                    or obs.stl_node_text_embeddings is not None
+                ):
+                    stl_tokens = self.stl_encoder(
+                        token_embeddings=token_embeddings,
+                        token_ids=token_ids,
+                        text_embeddings=obs.stl_node_text_embeddings,
+                        node_mask=obs.stl_node_mask,
+                        adjacency=obs.stl_adjacency,
+                    )
+                    tokens.append(stl_tokens)
+                    input_mask.append(obs.stl_node_mask)
+                    ar_mask += [False] * stl_tokens.shape[1]
+            else:
+                logger.warning("STL encoder is enabled but stl_node_mask/stl_adjacency are missing; skipping STL tokens.")
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)

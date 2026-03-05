@@ -74,6 +74,23 @@ class ModelTransformFactory(GroupFactory):
     default_prompt: str | None = None
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        stl_transforms = []
+        if isinstance(model_config, pi0_config.Pi0Config) and model_config.use_stl:
+            stl_transforms.append(
+                _transforms.TokenizeSTLText(
+                    max_nodes=model_config.stl_max_nodes,
+                    vocab_size=model_config.stl_vocab_size,
+                    semantic_tokenizer=(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len)
+                        if model_config.stl_use_ap_semantic_tokens
+                        else None
+                    ),
+                    ap_max_tokens=model_config.stl_ap_max_tokens,
+                    default_stl_text=model_config.stl_default_formula,
+                    use_symbolic_ids=model_config.stl_use_symbolic_ids,
+                    use_object_hash_in_8d=model_config.stl_use_object_hash_in_8d,
+                )
+            )
         match model_config.model_type:
             case _model.ModelType.PI0:
                 return _transforms.Group(
@@ -83,6 +100,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
+                        *stl_transforms,
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
                 )
@@ -96,6 +114,7 @@ class ModelTransformFactory(GroupFactory):
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
                         ),
+                        *stl_transforms,
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
                 )
@@ -182,20 +201,21 @@ class LeRobotDroneToTableDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_structure = {
+            "observation/image": "image",
+            "observation/wrist_image": "wrist_image",
+            "observation/state": "state",
+            "actions": "actions",
+            "prompt": "prompt",  # produced when prompt_from_task=True
+            # If you don't use prompt_from_task, use:
+            # "prompt": "task",
+        }
         # Repack LeRobot keys to the "common" keys expected by policy transforms.
         # (This follows LIBERO pattern.)
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
-                    {
-                        "observation/image": "image",
-                        "observation/wrist_image": "wrist_image",
-                        "observation/state": "state",
-                        "actions": "actions",
-                        "prompt": "prompt",  # produced when prompt_from_task=True
-                        # If you don't use prompt_from_task, use:
-                        # "prompt": "task",
-                    }
+                    repack_structure
                 )
             ]
         )
@@ -352,6 +372,29 @@ _CONFIGS = [
             action_horizon=10,
             discrete_state_input=False,
             action_dim=32,   # IMPORTANT for pi05 base checkpoints
+        ),
+        data=LeRobotDroneToTableDataConfig(
+            repo_id="Celina717/drone_to_table_lerobot_xyz_10hz",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=64,
+        num_workers=2,
+    ),
+    TrainConfig(
+        name="pi05_drone_to_table_stl",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            action_dim=32,
+            use_stl=True,
+            stl_max_nodes=32,
+            stl_gnn_layers=2,
+            stl_vocab_size=4096,
+            stl_use_llm_token_embeddings=False,
         ),
         data=LeRobotDroneToTableDataConfig(
             repo_id="Celina717/drone_to_table_lerobot_xyz_10hz",

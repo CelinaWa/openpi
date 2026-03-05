@@ -59,6 +59,17 @@ class DroneToTableInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # Optional semantic STL inputs (if provided by dataset/runtime).
+        for key in (
+            "stl_text",
+            "stl_node_token_ids",
+            "stl_node_mask",
+            "stl_adjacency",
+            "stl_node_text_embeddings",
+        ):
+            if key in data:
+                inputs[key] = data[key]
+
         return inputs
 
 
