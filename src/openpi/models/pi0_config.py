@@ -34,13 +34,15 @@ class Pi0Config(_model.BaseModelConfig):
     # Optional semantic STL prefix encoder.
     use_stl: bool = False
     stl_max_nodes: int = 32
-    stl_gnn_layers: int = 2
+    stl_gnn_layers: int = 4
     stl_vocab_size: int = 4096
     stl_text_embedding_dim: int = 384
     stl_ap_max_tokens: int = 8
     stl_use_ap_semantic_tokens: bool = True
     stl_use_symbolic_ids: bool = False
     stl_use_object_hash_in_8d: bool = False
+    # If true, use GCNConv-style normalized propagation with self-loops.
+    stl_use_gcn_conv: bool = True
     stl_default_formula: str | None = "G[0:10](avoid(obstacle)) AND F[0:10](reach(target))"
     # If true, `stl_node_token_ids` are interpreted as PaliGemma vocab ids.
     # If false, ids are interpreted as custom STL vocabulary ids in [0, stl_vocab_size).

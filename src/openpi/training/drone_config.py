@@ -277,6 +277,13 @@ class TrainConfig:
     num_train_steps: int = 30_000
 
     log_interval: int = 100
+    # If set, enables train/val split for torch-based datasets (LeRobot) using this ratio for validation.
+    # Set to None to disable validation split.
+    val_split_ratio: float | None = None
+    # Validation frequency in train steps.
+    val_interval: int = 500
+    # Optional max number of validation batches per evaluation.
+    val_num_batches: int | None = 20
     save_interval: int = 1000
     keep_period: int | None = 5000
 
@@ -338,6 +345,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
         batch_size=64,
+        val_split_ratio=0.2,
         num_workers=2,
     ),
 
@@ -359,6 +367,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=30_000,
         batch_size=64,
+        val_split_ratio=0.2,
         num_workers=2,
     ),
 
@@ -381,6 +390,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
         batch_size=64,
+        val_split_ratio=0.2,
         num_workers=2,
     ),
     TrainConfig(
@@ -392,7 +402,7 @@ _CONFIGS = [
             action_dim=32,
             use_stl=True,
             stl_max_nodes=32,
-            stl_gnn_layers=2,
+            stl_gnn_layers=4,
             stl_vocab_size=4096,
             stl_use_llm_token_embeddings=False,
         ),
@@ -404,6 +414,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
         batch_size=64,
+        val_split_ratio=0.2,
         num_workers=2,
     ),
 

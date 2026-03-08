@@ -212,6 +212,18 @@ def train_step(
     return new_state, info
 
 
+@at.typecheck
+def eval_step(
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> at.Array:
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+    observation, actions = batch
+    return jnp.mean(model.compute_loss(rng, observation, actions, train=False))
+
+
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -242,10 +254,28 @@ def main(config: _config.TrainConfig):
         config,
         sharding=data_sharding,
         shuffle=True,
+        split="train",
+        val_split_ratio=config.val_split_ratio,
+        split_seed=config.seed,
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+
+    val_loader = None
+    if config.val_split_ratio is not None:
+        eval_num_batches = config.val_num_batches if config.val_num_batches is not None else 20
+        val_loader = _data_loader.create_data_loader(
+            config,
+            sharding=data_sharding,
+            shuffle=False,
+            num_batches=eval_num_batches,
+            split="val",
+            val_split_ratio=config.val_split_ratio,
+            split_seed=config.seed,
+        )
+        val_batch = next(iter(val_loader))
+        logging.info(f"Initialized validation loader:\n{training_utils.array_tree_to_info(val_batch)}")
 
     # Log images from first batch to sanity check.
     images_to_log = [
@@ -266,6 +296,11 @@ def main(config: _config.TrainConfig):
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
+    )
+    peval_step = jax.jit(
+        eval_step,
+        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        out_shardings=replicated_sharding,
     )
 
     start_step = int(train_state.step)
@@ -288,6 +323,23 @@ def main(config: _config.TrainConfig):
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
+
+        if (
+            val_loader is not None
+            and step % config.val_interval == 0
+            and step > start_step
+        ):
+            val_losses = []
+            val_iter = iter(val_loader)
+            eval_rng = jax.random.fold_in(train_rng, step)
+            for val_batch in val_iter:
+                eval_rng, eval_step_rng = jax.random.split(eval_rng)
+                val_loss = peval_step(eval_step_rng, train_state, val_batch)
+                val_losses.append(val_loss)
+            if val_losses:
+                val_loss_mean = jax.device_get(jnp.mean(jnp.stack(val_losses)))
+                pbar.write(f"Step {step}: val_loss={val_loss_mean:.4f}")
+                wandb.log({"val_loss": val_loss_mean}, step=step)
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:

@@ -593,6 +593,13 @@ class TrainConfig:
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
+    # If set, enables train/val split for torch-based datasets (LeRobot) using this ratio for validation.
+    # Set to None to disable validation split.
+    val_split_ratio: float | None = None
+    # Validation frequency in train steps.
+    val_interval: int = 500
+    # Optional max number of validation batches per evaluation.
+    val_num_batches: int | None = 20
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
@@ -860,6 +867,7 @@ _CONFIGS = [
     pytorch_weight_path="/workspace/checkpoints/pi05_base_pytorch",
     num_train_steps=30_000,
     batch_size=64, # XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_drone_to_table --exp-name exp1_bs8
+    val_split_ratio=0.2,
 
     ),
     TrainConfig(
@@ -871,11 +879,6 @@ _CONFIGS = [
         discrete_state_input=False,
         paligemma_variant="gemma_2b_lora",
         action_expert_variant="gemma_300m_lora",
-        use_stl=True,
-        stl_max_nodes=32,
-        stl_gnn_layers=2,
-        stl_vocab_size=4096,
-        stl_use_llm_token_embeddings=False,
     ),
     data=LeRobotDroneToTableDataConfig(
         repo_id="Celina717/drone_to_table_lerobot_first100",
@@ -883,6 +886,20 @@ _CONFIGS = [
         extra_delta_transform=False,
     ),
     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+
+    freeze_filter=pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=32,
+        action_horizon=10,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+    ).get_freeze_filter(),
+    ema_decay=None,
+    batch_size=16,
+    val_split_ratio=0.2,
+    num_train_steps=30_000,
+    ),
 
     TrainConfig(
     name="pi05_drone_to_table_stl",
@@ -893,7 +910,7 @@ _CONFIGS = [
         discrete_state_input=False,
         use_stl=True,
         stl_max_nodes=32,
-        stl_gnn_layers=2,
+        stl_gnn_layers=4,
         stl_vocab_size=4096,
         stl_use_llm_token_embeddings=False,
     ),
@@ -906,6 +923,7 @@ _CONFIGS = [
     pytorch_weight_path="/workspace/checkpoints/pi05_base_pytorch",
     num_train_steps=30_000,
     batch_size=64,
+    val_split_ratio=0.2,
     ),
     TrainConfig(
     name="pi05_drone_to_table_stl_lora",
@@ -918,7 +936,7 @@ _CONFIGS = [
         action_expert_variant="gemma_300m_lora",
         use_stl=True,
         stl_max_nodes=32,
-        stl_gnn_layers=2,
+        stl_gnn_layers=4,
         stl_vocab_size=4096,
         stl_use_llm_token_embeddings=False,
     ),
@@ -938,12 +956,13 @@ _CONFIGS = [
         action_expert_variant="gemma_300m_lora",
         use_stl=True,
         stl_max_nodes=32,
-        stl_gnn_layers=2,
+        stl_gnn_layers=4,
         stl_vocab_size=4096,
         stl_use_llm_token_embeddings=False,
     ).get_freeze_filter(),
     ema_decay=None,
     batch_size=8,
+    val_split_ratio=0.2,
     num_train_steps=30_000,
     ),
 

@@ -421,17 +421,40 @@ class TokenizeSTLText(DataTransformFn):
     use_symbolic_ids: bool = False
     use_object_hash_in_8d: bool = False
 
-    def _parse_ap_semantics(self, ap_text: str) -> tuple[float, float]:
-        """Extract AP type and object id from canonical APs like reach(obj), avoid(obj)."""
+    def _normalize_object_name(self, obj_name: str) -> str:
+        obj_name = obj_name.strip().lower()
+        obj_name = re.sub(r"\s+", " ", obj_name)
+        return obj_name
+
+    def _parse_ap_semantics(self, ap_text: str) -> tuple[float, float, str | None, float]:
+        """Extract AP type, object id/text, and threshold from canonical APs.
+
+        Supported forms:
+          - reach(obj), avoid(obj) -> threshold defaults to 0
+          - reach(obj, 5), avoid(obj, 5)
+        """
         text = ap_text.strip().lower()
-        m = re.match(r"^\s*(reach|avoid)\s*\(\s*([a-z0-9_:\-\.]+)\s*\)\s*$", text)
-        if m is None:
-            return 0.0, -1.0
-        ap_word, obj_name = m.group(1), m.group(2)
+
+        m = re.match(
+            r"^\s*(reach|avoid)\s*\(\s*([^)]+?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*$",
+            text,
+        )
+        threshold = 0.0
+        if m is not None:
+            ap_word = m.group(1)
+            obj_name = self._normalize_object_name(m.group(2))
+            threshold = float(m.group(3))
+        else:
+            m = re.match(r"^\s*(reach|avoid)\s*\(\s*([^)]+?)\s*\)\s*$", text)
+            if m is None:
+                return 0.0, -1.0, None, 0.0
+            ap_word = m.group(1)
+            obj_name = self._normalize_object_name(m.group(2))
+
         ap_type_id = 1.0 if ap_word == "reach" else 2.0
         obj_hash = int(hashlib.sha1(obj_name.encode("utf-8")).hexdigest(), 16)
         obj_id_norm = float(obj_hash % max(1, self.vocab_size)) / float(max(1, self.vocab_size - 1))
-        return ap_type_id, obj_id_norm
+        return ap_type_id, obj_id_norm, obj_name, threshold
 
     def __call__(self, data: DataDict) -> DataDict:
         if "stl_node_mask" in data and "stl_adjacency" in data:
@@ -487,17 +510,18 @@ class TokenizeSTLText(DataTransformFn):
             for i in range(node_count):
                 _, node, depth, parent_op, child_idx = node_records[i]
                 node_mask[i] = True
-                semantic_phrase = node.kind.lower()
+                semantic_phrase = None
                 if node.kind == "AP":
                     ap_hash = int(hashlib.sha1(node.ap_text.lower().encode("utf-8")).hexdigest(), 16)
                     if self.use_symbolic_ids:
                         token_ids[i] = ap_token_offset + (ap_hash % max(1, self.vocab_size - ap_token_offset))
                     operator_id = 0.0
-                    ap_type_id, obj_id_norm = self._parse_ap_semantics(node.ap_text)
+                    ap_type_id, obj_id_norm, obj_name, threshold = self._parse_ap_semantics(node.ap_text)
                     if not self.use_object_hash_in_8d:
                         obj_id_norm = -1.0
                     is_ap = 1.0
-                    semantic_phrase = node.ap_text
+                    # Semantic token branch uses object identity only.
+                    semantic_phrase = obj_name if obj_name is not None else None
                 else:
                     operator_id = float(op_ids[node.kind])
                     if self.use_symbolic_ids:
@@ -505,8 +529,10 @@ class TokenizeSTLText(DataTransformFn):
                     ap_type_id = 0.0
                     obj_id_norm = -1.0
                     is_ap = 0.0
+                    threshold = 0.0
                 is_left_until = float(parent_op == "UNTIL" and child_idx == 0)
-                reserved = 0.0
+                # Use the reserved channel for AP distance threshold when present.
+                reserved = float(threshold)
                 node_features[i] = np.asarray(
                     [
                         operator_id,
@@ -520,7 +546,7 @@ class TokenizeSTLText(DataTransformFn):
                     ],
                     dtype=np.float32,
                 )
-                if self.semantic_tokenizer is not None:
+                if self.semantic_tokenizer is not None and semantic_phrase:
                     ap_tokens = self.semantic_tokenizer._tokenizer.encode(semantic_phrase, add_bos=False, add_eos=False)
                     ap_tokens = ap_tokens[: self.ap_max_tokens]
                     text_token_ids[i, : len(ap_tokens)] = np.asarray(ap_tokens, dtype=np.int32)
@@ -548,11 +574,6 @@ class TokenizeSTLText(DataTransformFn):
                 )
                 if i > 0:
                     adjacency[i, i - 1] = True
-                if self.semantic_tokenizer is not None:
-                    ap_tokens = self.semantic_tokenizer._tokenizer.encode(token, add_bos=False, add_eos=False)
-                    ap_tokens = ap_tokens[: self.ap_max_tokens]
-                    text_token_ids[i, : len(ap_tokens)] = np.asarray(ap_tokens, dtype=np.int32)
-                    text_token_mask[i, : len(ap_tokens)] = True
 
         output = {
             **data,

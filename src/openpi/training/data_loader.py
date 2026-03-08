@@ -228,6 +228,9 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    split: Literal["train", "val"] = "train",
+    val_split_ratio: float | None = None,
+    split_seed: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -243,6 +246,8 @@ def create_data_loader(
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
+        if val_split_ratio is not None:
+            raise ValueError("Validation split is not supported for RLDS loader yet.")
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
@@ -265,6 +270,9 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        split=split,
+        val_split_ratio=val_split_ratio,
+        split_seed=split_seed,
     )
 
 
@@ -281,6 +289,9 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    split: Literal["train", "val"] = "train",
+    val_split_ratio: float | None = None,
+    split_seed: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -301,6 +312,22 @@ def create_torch_data_loader(
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+
+    if val_split_ratio is not None:
+        if not (0.0 < val_split_ratio < 1.0):
+            raise ValueError(f"val_split_ratio must be in (0, 1), got {val_split_ratio}")
+        n = len(dataset)
+        if n < 2:
+            raise ValueError("Need at least 2 samples to create train/val split.")
+        n_val = max(1, int(n * val_split_ratio))
+        if n_val >= n:
+            n_val = n - 1
+        rng = np.random.default_rng(split_seed)
+        perm = rng.permutation(n)
+        val_indices = perm[:n_val].tolist()
+        train_indices = perm[n_val:].tolist()
+        indices = train_indices if split == "train" else val_indices
+        dataset = torch.utils.data.Subset(dataset, indices)
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size

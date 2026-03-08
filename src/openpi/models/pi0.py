@@ -26,6 +26,7 @@ class SemanticSTLEncoder(nnx.Module):
         self.text_embedding_dim = config.stl_text_embedding_dim
         self.use_llm_token_embeddings = config.stl_use_llm_token_embeddings
         self.use_symbolic_ids = config.stl_use_symbolic_ids
+        self.use_gcn_conv = config.stl_use_gcn_conv
 
         # Used when ids are custom STL vocabulary ids.
         if self.use_symbolic_ids and not self.use_llm_token_embeddings:
@@ -88,11 +89,24 @@ class SemanticSTLEncoder(nnx.Module):
         node_mask_f = node_mask.astype(h.dtype)
         h = h * node_mask_f[..., None]
         adjacency_f = adjacency.astype(h.dtype)
+        node_valid_pair = node_mask_f[:, :, None] * node_mask_f[:, None, :]
+
+        if self.use_gcn_conv:
+            # GCNConv-style normalized propagation:
+            # H' = D^{-1/2} (A + I) D^{-1/2} H W
+            n = adjacency_f.shape[1]
+            eye = jnp.eye(n, dtype=h.dtype)[None, :, :]
+            a_hat = (adjacency_f + eye) * node_valid_pair
+            degree = jnp.sum(a_hat, axis=-1)
+            degree_inv_sqrt = jnp.where(degree > 0, jnp.power(degree, -0.5), 0.0)
+            norm_adj = degree_inv_sqrt[:, :, None] * a_hat * degree_inv_sqrt[:, None, :]
+        else:
+            norm_adj = adjacency_f * node_valid_pair
 
         for i in range(self.gnn_layers):
             self_mlp = self.self_mlps[f"layer_{i}"]
             child_mlp = self.child_mlps[f"layer_{i}"]
-            child_agg = jnp.einsum("bij,bjd->bid", adjacency_f, h, precision=jax.lax.Precision.HIGHEST)
+            child_agg = jnp.einsum("bij,bjd->bid", norm_adj, h, precision=jax.lax.Precision.HIGHEST)
             h_next = nnx.swish(self_mlp(h) + child_mlp(child_agg))
             h = h + h_next
             h = h * node_mask_f[..., None]
